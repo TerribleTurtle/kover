@@ -39,6 +39,8 @@ class ReadingListsPageContent extends HookConsumerWidget {
       ),
     );
 
+    useListenable(controller);
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(syncManagerProvider.notifier).syncReadingLists();
     });

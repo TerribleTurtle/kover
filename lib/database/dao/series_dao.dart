@@ -115,20 +115,62 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
         .watchSingleOrNull(distinct: true);
   }
 
+  /// Match series title or metadata columns for a single [token].
+  Expression<bool> matchesSeriesToken(String token) {
+    final metadataMatch =
+        db.seriesMetadata.id.isInQuery(
+          selectOnly(db.seriesPeopleRoles)
+            ..addColumns([db.seriesPeopleRoles.seriesMetadataId])
+            ..where(
+              db.seriesPeopleRoles.personId.isInQuery(
+                matchingPersonIds(db, token),
+              ),
+            ),
+        ) |
+        db.seriesMetadata.id.isInQuery(
+          selectOnly(db.seriesGenres)
+            ..addColumns([db.seriesGenres.seriesMetadataId])
+            ..where(
+              db.seriesGenres.genreId.isInQuery(matchingGenreIds(db, token)),
+            ),
+        ) |
+        db.seriesMetadata.id.isInQuery(
+          selectOnly(db.seriesTags)
+            ..addColumns([db.seriesTags.seriesMetadataId])
+            ..where(db.seriesTags.tagId.isInQuery(matchingTagIds(db, token))),
+        );
+
+    return containsAny(token, seriesTitleColumns(db)) |
+        series.id.isInQuery(
+          selectOnly(db.seriesMetadata)
+            ..addColumns([db.seriesMetadata.seriesId])
+            ..where(metadataMatch),
+        );
+  }
+
+  /// Match series title or metadata columns across all tokens in [query].
+  Expression<bool> matchesSeriesQuery(String query) =>
+      matchesAllTokens(query, matchesSeriesToken);
+
   /// Search series by [query].
   Future<List<SeriesData>> searchSeries(String query) async {
-    final q = managers.series
-        .filter((f) => f.libraryId.includeInSearch(true))
-        .filter(
-          (f) =>
-              f.name.contains(query) |
-              f.sortName.contains(query) |
-              f.localizedName.contains(query) |
-              f.originalName.contains(query),
-        )
-        .orderBy((o) => o.sortName.asc());
+    if (query.trim().isEmpty) return [];
 
-    return await q.get();
+    final titleRank = titleMatchRank(query, seriesTitleColumns(db));
+
+    final q =
+        select(series).join([
+            innerJoin(libraries, libraries.id.equalsExp(series.libraryId)),
+          ])
+          ..where(
+            libraries.includeInSearch.equals(true) & matchesSeriesQuery(query),
+          )
+          ..orderBy([
+            OrderingTerm.asc(titleRank),
+            OrderingTerm.asc(series.sortName),
+          ]);
+
+    return await q.map((row) => row.readTable(series)).get();
   }
 
   /// Filter series by [query]. Optionally filter by [libraryId]
@@ -149,15 +191,7 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
             readingProgress.seriesId.equalsExp(series.id),
           ),
         ]))..where(
-          containsAny(
-            query,
-            [
-              series.name,
-              series.sortName,
-              series.localizedName,
-              series.originalName,
-            ],
-          ),
+          matchesSeriesQuery(query),
         );
 
     if (libraryId != null) {
@@ -410,17 +444,7 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
           );
 
           if (query.isNotEmpty) {
-            q.where(
-              containsAny(
-                query,
-                [
-                  series.name,
-                  series.sortName,
-                  series.localizedName,
-                  series.originalName,
-                ],
-              ),
-            );
+            q.where(matchesSeriesQuery(query));
           }
 
           if (downloadedOnly) {
@@ -485,12 +509,7 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
           );
 
     if (query.isNotEmpty) {
-      q.where(
-        series.name.contains(query) |
-            series.sortName.contains(query) |
-            series.localizedName.contains(query) |
-            series.originalName.contains(query),
-      );
+      q.where(matchesSeriesQuery(query));
     }
 
     if (downloadedOnly) {
@@ -524,12 +543,7 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
           );
 
     if (query.isNotEmpty) {
-      q.where(
-        series.name.contains(query) |
-            series.sortName.contains(query) |
-            series.localizedName.contains(query) |
-            series.originalName.contains(query),
-      );
+      q.where(matchesSeriesQuery(query));
     }
 
     if (downloadedOnly) {
@@ -568,17 +582,7 @@ class SeriesDao extends DatabaseAccessor<AppDatabase> with _$SeriesDaoMixin {
     ])..where(wantToRead.isWantToRead.equals(true));
 
     if (query.isNotEmpty) {
-      q.where(
-        containsAny(
-          query,
-          [
-            series.name,
-            series.sortName,
-            series.localizedName,
-            series.originalName,
-          ],
-        ),
-      );
+      q.where(matchesSeriesQuery(query));
     }
 
     if (downloadedOnly) {

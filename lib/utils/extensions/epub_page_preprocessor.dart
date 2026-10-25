@@ -76,12 +76,9 @@ extension EpubPagePreprocessor on DocumentFragment {
           .map((e) => '${e.key}: ${e.value};')
           .join(' ');
 
+      // Inline styles go last so they win over stylesheet rules.
       final existing = element.attributes['style'] ?? '';
-      final separator = (existing.isNotEmpty && !existing.trim().endsWith(';'))
-          ? ';'
-          : '';
-
-      element.attributes['style'] = '$existing$separator $newStyles'.trim();
+      element.attributes['style'] = '$newStyles $existing'.trim();
     });
   }
 
@@ -105,49 +102,52 @@ extension EpubPagePreprocessor on DocumentFragment {
 }
 
 class _TextIndentVisitor extends TreeVisitor {
-  static const blockElements = {
-    'div',
-    'p',
-    'h1',
-    'h2',
-    'h3',
-    'h4',
-    'h5',
-    'h6',
-    'li',
-  };
+  Expression? _inheritedTextIndent;
+  String? _inheritedTextAlign;
 
-  String? _inheritedTextIndent;
+  static bool _hasPositiveIndent(Expression? expr) => switch (expr) {
+    LiteralTerm(value: final num amount) => amount > 0,
+    _ => false,
+  };
 
   @override
   void visitElement(Element element) {
     final explicitTextIndent = element.styles
         .where((s) => s.property == 'text-indent')
-        .firstOrNull
-        ?.value
-        ?.span
-        ?.text;
+        .lastOrNull
+        ?.value;
+
+    final explicitTextAlign = element.styles
+        .where((s) => s.property == 'text-align')
+        .lastOrNull
+        ?.term
+        ?.toLowerCase();
 
     final currentTextIndent = explicitTextIndent ?? _inheritedTextIndent;
+    final currentTextAlign = explicitTextAlign ?? _inheritedTextAlign;
 
-    if (currentTextIndent != null &&
-        blockElements.contains(element.localName)) {
+    if (element.localName == 'p' &&
+        _hasPositiveIndent(currentTextIndent) &&
+        currentTextAlign != 'center') {
       final span = Element.tag('span')
         ..text = ' '
         ..attributes[HtmlConstants.textIndentSpanAttribute] = ''
         ..attributes['style'] =
-            'display: inline-block; width: $currentTextIndent';
+            'display: inline-block; width: ${currentTextIndent?.span?.text}';
 
       element.insertBefore(span, element.firstChild);
     }
 
-    final previousInherited = _inheritedTextIndent;
+    final previousInheritedIndent = _inheritedTextIndent;
+    final previousInheritedAlign = _inheritedTextAlign;
 
     _inheritedTextIndent = currentTextIndent;
+    _inheritedTextAlign = currentTextAlign;
 
     super.visitElement(element);
 
-    _inheritedTextIndent = previousInherited;
+    _inheritedTextIndent = previousInheritedIndent;
+    _inheritedTextAlign = previousInheritedAlign;
   }
 }
 

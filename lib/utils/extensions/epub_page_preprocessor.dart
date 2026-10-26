@@ -102,6 +102,18 @@ extension EpubPagePreprocessor on DocumentFragment {
 }
 
 class _TextIndentVisitor extends TreeVisitor {
+  static const blockElements = {
+    'div',
+    'p',
+    'h1',
+    'h2',
+    'h3',
+    'h4',
+    'h5',
+    'h6',
+    'li',
+  };
+
   Expression? _inheritedTextIndent;
   String? _inheritedTextAlign;
 
@@ -126,7 +138,8 @@ class _TextIndentVisitor extends TreeVisitor {
     final currentTextIndent = explicitTextIndent ?? _inheritedTextIndent;
     final currentTextAlign = explicitTextAlign ?? _inheritedTextAlign;
 
-    if (element.localName == 'p' &&
+    if (blockElements.contains(element.localName) &&
+        !element.children.any((c) => blockElements.contains(c.localName)) &&
         _hasPositiveIndent(currentTextIndent) &&
         currentTextAlign != 'center') {
       final span = Element.tag('span')

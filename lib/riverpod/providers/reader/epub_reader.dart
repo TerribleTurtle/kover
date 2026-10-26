@@ -51,6 +51,8 @@ sealed class EpubReflowState with _$EpubReflowState {
 
 @riverpod
 class EpubReflow extends _$EpubReflow {
+  static const _wrapperTags = {'div', 'section', 'article', 'main', 'body'};
+
   final _pipeline = HeadlessMeasurePipeline();
   Timer? _debounceReflow;
   late EpubMeasureWidgetBuilder _measureBuilder;
@@ -129,11 +131,31 @@ class EpubReflow extends _$EpubReflow {
     _cursor = ExponentialBinaryReflowEngine(
       root: pageContent.root.children.first,
     );
+    _unwrapRootContainers(pageContent.root.children.first);
 
     return EpubReflowState(
       page: pageContent,
       scrollId: resumeScrollId,
     );
+  }
+
+  void _unwrapRootContainers(Node root) {
+    var current = root;
+    var target = _cursor.buffer;
+    while (current.children.length == 1 &&
+        current.nodes.where((n) => n.hasVisibleNodes).length == 1) {
+      final only = current.children.single;
+      if (!_wrapperTags.contains(only.localName) ||
+          only.children.isEmpty ||
+          only.isIndentSpan) {
+        break;
+      }
+      while (target.children.isEmpty || _cursor.buffer.hasVisibleNodes) {
+        _cursor.buffer.hasVisibleNodes ? _cursor.overflow() : _cursor.addNext();
+      }
+      current = only;
+      target = target.children.single;
+    }
   }
 
   /// Runs the reflow loop synchronously against the headless
@@ -183,10 +205,17 @@ class EpubReflow extends _$EpubReflow {
       if (!ref.mounted) return;
 
       final stopwatch = Stopwatch()..start();
+      final measuredHeights = <String, double>{};
+      var warmedUp = false;
 
       while (ref.mounted &&
           _pipeline.isAttached &&
           state.value?.status == .measuring) {
+        if (warmedUp && !_cursor.buffer.hasVisibleNodes) {
+          await _addElement();
+          continue;
+        }
+
         final maxHeight = _pipeline.viewportSize?.height ?? viewport.height;
         final bufferHtml = _cursor.buffer.outerHtml;
 
@@ -197,9 +226,14 @@ class EpubReflow extends _$EpubReflow {
           return;
         }
 
-        final height = _pipeline
-            .measure(_measureBuilder(bufferHtml, current.page.styles))
-            .height;
+        final height = warmedUp
+            ? (measuredHeights[bufferHtml] ??= _pipeline
+                  .measure(_measureBuilder(bufferHtml, current.page.styles))
+                  .height)
+            : _pipeline
+                  .measure(_measureBuilder(bufferHtml, current.page.styles))
+                  .height;
+        warmedUp = true;
 
         // A zero-height measure for non-empty content means the measure
         // pass is silently broken; never treat it as "fits".
@@ -215,6 +249,9 @@ class EpubReflow extends _$EpubReflow {
           await _addElement();
         } else {
           await _handleOverflow();
+          if (state.value?.subpages.length != current.subpages.length) {
+            measuredHeights.clear();
+          }
         }
 
         // Yield to the event loop periodically to keep the UI responsive.

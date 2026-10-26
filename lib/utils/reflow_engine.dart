@@ -23,8 +23,17 @@ abstract class ReflowEngine {
 /// unit is found, the engine descends one level and repeats, until the unit is
 /// unsplittable (same end condition as the previous linear cursor).
 class ExponentialBinaryReflowEngine implements ReflowEngine {
-  static const Set<String> _leafTags = {'img', 'svg'};
-  static final _wordsReg = RegExp(r'(?=\s)');
+  static const _leafTags = {'img', 'svg', 'ruby', 'sup', 'sub'};
+  static const _cjk =
+      r'\u3007\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af';
+  static const _cjkOpen = r'‘“〈《「『【〔〖〘〚〝﹙﹛﹝（［｛｟｢\([\{';
+  static const _closePunct =
+      r'·‐–-―’”‥…‰′″‼⁇-⁉、。々〉》」』】〕〗〙〛〜〞〟〰-〵〻〼ぁぃぅぇぉっゃゅょゎゕ-ゞ'
+      r'゠ァィゥェォッャュョヮヵヶ・-ヾㇰ-ㇿ﹐-﹗﹚﹜﹞！％），．：；？］｝～｠｡｣-ｰﾞﾟ.,;:!?\x27"\)\]\}>';
+  static final _wordsReg = RegExp(
+    '(?<!\\s)(?=\\s)|(?<![\\s$_cjkOpen])(?:(?![$_closePunct])(?=[$_cjk])|(?=[$_cjkOpen]+[$_cjk]))|(?<=[$_cjk][$_closePunct]*)(?=[^\\s$_closePunct])',
+  );
+  static final _closingPunctOnlyReg = RegExp('^[$_closePunct]+\$');
 
   final Element _root;
   final Element _buffer;
@@ -41,7 +50,12 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
 
   @override
   bool addNext() {
-    if (_frames.isEmpty) return false;
+    if (_frames.isEmpty) {
+      for (final p in _buffer.querySelectorAll('p')) {
+        if (!p.hasVisibleNodes) p.remove();
+      }
+      return false;
+    }
 
     final frame = _frames.last;
 
@@ -58,7 +72,7 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
       // The whole level fits: pop. The parent resumes past the straddler
       // slot, which permanently shows the child shell from now on.
       _frames.removeLast();
-      if (_frames.isEmpty) return false;
+      if (_frames.isEmpty) return addNext();
 
       final parent = _frames.last;
       final slot = parent.splitAt!;
@@ -116,8 +130,7 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
     if (unit is Text) {
       final segments = _textSegments(unit.text);
       if (segments == null) {
-        _acceptUnsplittable(frame);
-        return false;
+        return _resolveUnsplittable(frame, unit);
       }
 
       frame.pending
@@ -131,10 +144,10 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
 
     if (unit is! Element ||
         _leafTags.contains(unit.localName) ||
+        _isStickyMarker(unit) ||
         unit.nodes.isEmpty ||
-        unit.attributes.containsKey(HtmlConstants.textIndentSpanAttribute)) {
-      _acceptUnsplittable(frame);
-      return false;
+        unit.isIndentSpan) {
+      return _resolveUnsplittable(frame, unit);
     }
 
     // Descend one level: swap the tree node for an empty shell clone. The
@@ -149,15 +162,32 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
 
   @override
   Element commitSplit() {
-    final frame = _frames.last;
+    var frame = _frames.last;
 
     // Backtrack the overflower so it resumes on the next page. An accepted
     // unsplittable overflower (p == lo) stays on the committed page.
     if (frame.p > frame.lo && frame.target.nodes.isNotEmpty) {
-      frame.target.nodes.removeLast();
+      _rebuild(frame..p = frame.lo);
+    }
+    if (frame.lo > 0 && !frame.target.hasVisibleNodes) {
+      _rebuild(frame..p = frame.lo = 0);
+    }
+    while (_frames.length > 1 && !frame.target.hasVisibleNodes) {
+      final child = _frames.removeLast().pending;
+      ((frame = _frames.last).pending[frame.splitAt!] as Element).nodes
+        ..clear()
+        ..addAll(child);
+      if (!frame.target.hasVisibleNodes) frame.lo = 0;
+      _rebuild(frame..p = (frame..splitAt = null).lo);
     }
 
     frame.pending.removeRange(0, frame.lo);
+    while (_frames.length > 1 && !frame.pending.any((n) => n.hasVisibleNodes)) {
+      _frames.removeLast();
+      (frame = _frames.last)
+        ..pending.removeRange(0, frame.splitAt! + 1)
+        ..splitAt = null;
+    }
 
     // Drop whitespace at the start of the next page.
     if (frame.pending.isNotEmpty && frame.pending.first is Text) {
@@ -211,18 +241,67 @@ class ExponentialBinaryReflowEngine implements ReflowEngine {
     return result;
   }
 
-  /// Marks an unsplittable overflower as accepted when the current page
-  /// holds nothing else: it gets the page to itself (visually overflowing)
-  /// and [commitSplit] consumes it, guaranteeing progress.
-  void _acceptUnsplittable(_Frame frame) {
-    if (frame.lo == 0 && _frames.every((f) => (f.splitAt ?? 0) == 0)) {
-      frame.lo = frame.p;
+  /// Rewinds sticky trailing nodes or accepts an unsplittable overflower.
+  bool _resolveUnsplittable(_Frame frame, Node unit) {
+    if (_isStickyTrailing(unit) && frame.lo > 0) {
+      var i = frame.lo - 1;
+      while (i > 0 &&
+          _isStickyTrailing(frame.pending[i]) &&
+          !_endsWithSpace(frame.pending[i - 1])) {
+        i--;
+      }
+      final prev = frame.pending[i];
+      if (!_endsWithSpace(prev)) {
+        var e = prev;
+        while (e is Element && e.nodes.length == 1 && e.children.isNotEmpty) {
+          e = e.children.first;
+        }
+        final canSplit =
+            e is Text ||
+            (e is Element &&
+                !_leafTags.contains(e.localName) &&
+                e.nodes.every((n) => n is Text));
+        final words = canSplit ? _textSegments(e.text!) : null;
+        if (words != null) {
+          e.text = words.take(words.length - 1).join();
+          frame.pending.replaceRange(i, i + 1, [prev.clone(true), prev]);
+          e.text = words.last.trimLeft();
+          frame.hi++;
+          _rebuild(frame..lo = frame.p = i + 1);
+          return false;
+        }
+        if (_hasVisibleBefore(frame, i)) frame.lo = i;
+      }
     }
+    if (!_hasVisibleBefore(frame, frame.lo)) frame.lo = frame.p;
+    return false;
   }
 
-  /// Splits [text] into words. The whitespace leads the following word, so a
-  /// page-ending word is measured without its trailing whitespace while no
-  /// whitespace is lost. Returns null when the text is a single word.
+  bool _endsWithSpace(Node n) => (n.text ?? '').trimRight() != (n.text ?? '');
+
+  bool _isStickyMarker(Element el) =>
+      el.attributes['epub:type'] == 'noteref' ||
+      el.attributes['role'] == 'doc-noteref' ||
+      switch (el.localName) {
+        'sup' || 'sub' => true,
+        'a' => el.hasText && _textSegments(el.text) == null,
+        'span' => el.nodes.length == 1 && _isStickyTrailing(el.nodes.first),
+        _ => false,
+      };
+
+  bool _isStickyTrailing(Node n) => switch (n) {
+    Text(:final text) => _closingPunctOnlyReg.hasMatch(text.trim()),
+    Element() => (!n.hasVisibleNodes && !n.isIndentSpan) || _isStickyMarker(n),
+    _ => false,
+  };
+
+  bool _hasVisibleBefore(_Frame frame, int index) =>
+      frame.pending.take(index).any((n) => n.hasVisibleNodes) ||
+      _frames.any(
+        (f) => f.pending.take(f.splitAt ?? 0).any((n) => n.hasVisibleNodes),
+      );
+
+  /// Splits [text] into words and CJK units. Returns null for a single unit.
   List<String>? _textSegments(String text) {
     final words = text
         .split(_wordsReg)

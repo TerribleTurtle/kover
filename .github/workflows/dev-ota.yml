@@ -1,0 +1,139 @@
+name: Kover Dev OTA
+
+# Builds the signed side-by-side "Kover Dev" APK (`com.rodonisi.kover.dev`)
+# for arm64-v8a (Pixel 10 Pro XL / Pixel 6 Pro) from the synthesized `dev-ota`
+# branch (which mirrors local `main`'s exact tree on top of `upstream/main`
+# without pushing unsubmitted branch commit objects or triggering upstream
+# issue cross-references) and publishes a GitHub Release for Obtainium.
+
+on:
+  push:
+    branches:
+      - dev-ota
+  workflow_dispatch:
+
+concurrency:
+  group: dev-ota-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dev-ota:
+    name: Build Kover Dev APK (arm64-v8a) & Publish OTA Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: "gradle"
+
+      - name: Get FVM Configuration
+        uses: kuhnroyal/flutter-fvm-config-action@v3
+        id: fvm-config-action
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.fvm-config-action.outputs.FLUTTER_VERSION }}
+          channel: ${{ steps.fvm-config-action.outputs.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Compute Obtainium OTA version and release notes
+        id: meta
+        run: |
+          RAW=$(grep '^version:' pubspec.yaml | sed 's/version: *//' | tr -d '\r')
+          VERSION_NAME="${RAW%%+*}"
+          BUILD_NUMBER="${RAW##*+}"
+          COMMIT_MSG=$(git log -1 --format='%B' HEAD)
+          MAIN_SHA=$(echo "$COMMIT_MSG" | sed -n 's/.*\[main:\([0-9a-f]*\)\].*/\1/p')
+          [ -z "$MAIN_SHA" ] && MAIN_SHA=$(git rev-parse --short=8 HEAD)
+          BUILD_NAME="${VERSION_NAME}-dev.${GITHUB_RUN_NUMBER}"
+          TAG="v${BUILD_NAME}"
+
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "build_name=${BUILD_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Kover Dev OTA (\`${TAG}\`)"
+            echo "- **Package:** \`com.rodonisi.kover.dev\` (**Kover Dev** · \`arm64-v8a\`)"
+            echo "- **Base version:** \`${RAW}\` · **Local \`main\` snapshot:** \`${MAIN_SHA}\`"
+            echo ""
+            echo "$COMMIT_MSG" | tail -n +2
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Set up Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/kover-upload-key.jks"
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=$RUNNER_TEMP/kover-upload-key.jks
+          EOF
+
+      - name: Generate Riverpod, Freezed, Chopper, Drift & L10n code
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          flutter gen-l10n
+
+      - name: Build Kover Dev arm64-v8a release APK
+        env:
+          BUILD_NAME: ${{ steps.meta.outputs.build_name }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+        run: |
+          flutter build apk \
+            --release \
+            --build-name="$BUILD_NAME" \
+            --build-number="$BUILD_NUMBER" \
+            --target-platform android-arm64 \
+            --split-per-abi
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "kover-${BUILD_NAME}-arm64-v8a.apk"
+
+      - name: Publish GitHub Release for Obtainium OTA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          MAIN_SHA: ${{ steps.meta.outputs.main_sha }}
+          BUILD_NAME: ${{ steps.meta.outputs.build_name }}
+        run: |
+          APK="kover-${BUILD_NAME}-arm64-v8a.apk"
+          if [ ! -f "$APK" ]; then
+            echo "Expected APK $APK not found"
+            ls -la build/app/outputs/flutter-apk/ || true
+            exit 1
+          fi
+          echo "Publishing $APK to release $TAG..."
+
+          if gh release view "$TAG" &>/dev/null; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --title "Kover Dev ${TAG} (${MAIN_SHA})" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest
+          fi
+
+          # Keep the 5 most recent dev OTA releases so old builds don't accumulate
+          OLD_TAGS=$(gh release list --limit 30 --json tagName --jq '.[].tagName' | grep -E '^v.*-dev\.[0-9]+$' | tail -n +6 || true)
+          for old_tag in $OLD_TAGS; do
+            echo "Pruning old dev OTA release: $old_tag"
+            gh release delete "$old_tag" --cleanup-tag --yes || true
+          done

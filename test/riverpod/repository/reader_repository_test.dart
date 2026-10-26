@@ -86,6 +86,46 @@ void main() {
       ).called(1);
       verify(mockReaderDao.mergeProgressBatch([expected])).called(1);
     });
+
+    test('refreshChapterProgress merges the server progress', () async {
+      final repo = ReaderRepository(
+        db: mockDb,
+        readerClient: mockReaderClient,
+      );
+
+      final remote = ReadingProgressCompanion(
+        chapterId: const Value(1),
+        seriesId: const Value(1),
+        pagesRead: const Value(10),
+        bookScrollId: const Value('scrollId'),
+        lastModified: Value(DateTime.now()),
+      );
+
+      when(mockReaderClient.getProgress(1)).thenAnswer((_) async => remote);
+
+      await repo.refreshChapterProgress(chapterId: 1);
+
+      verify(mockReaderDao.mergeProgressBatch([remote])).called(1);
+    });
+
+    test('refreshChapterProgress also stores unread progress', () async {
+      final repo = ReaderRepository(
+        db: mockDb,
+        readerClient: mockReaderClient,
+      );
+
+      final remote = ReadingProgressCompanion(
+        chapterId: const Value(1),
+        pagesRead: const Value(0),
+        lastModified: Value(DateTime.utc(1)),
+      );
+
+      when(mockReaderClient.getProgress(1)).thenAnswer((_) async => remote);
+
+      await repo.refreshChapterProgress(chapterId: 1);
+
+      verify(mockReaderDao.mergeProgressBatch([remote])).called(1);
+    });
   });
 }
 

@@ -185,6 +185,13 @@ class ReaderRepository {
     );
   }
 
+  /// Fetch the server progress for [chapterId] and merge it with the local
+  /// one. Newer local progress that wasn't sent yet still wins.
+  Future<void> refreshChapterProgress({required int chapterId}) async {
+    final progress = await _readerClient.getProgress(chapterId);
+    await _db.readerDao.mergeProgressBatch([progress]);
+  }
+
   /// Synchronize all dirty progress entries by sending them to the backend,
   /// refetching the updated state and finally merging it with the local state.
   Future<void> mergeProgress() async {

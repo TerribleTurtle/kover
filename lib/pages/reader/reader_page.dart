@@ -8,7 +8,6 @@ import 'package:kover/generated/l10n/app_localizations.dart';
 import 'package:kover/pages/reader/epub_reader/epub_reader.dart';
 import 'package:kover/pages/reader/image_reader/image_reader.dart';
 import 'package:kover/pages/reader/pdf_reader/pdf_reader.dart';
-import 'package:kover/riverpod/managers/sync_manager/sync_manager.dart';
 import 'package:kover/riverpod/providers/reader/reader.dart';
 import 'package:kover/riverpod/providers/settings/common_reader_settings.dart';
 import 'package:kover/utils/layout_constants.dart';
@@ -37,80 +36,69 @@ class ReaderPage extends HookConsumerWidget {
     );
     final reader = ref.watch(provider);
 
-    return PopScope(
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) return;
-
-        Future.microtask(
-          () {
-            ref.read(syncManagerProvider.notifier).syncProgress();
+    return Async(
+      asyncValue: reader,
+      data: (data) {
+        return _ReaderSystemChrome(
+          seriesId: seriesId,
+          child: switch (data.series.format) {
+            .archive || .image => ImageReader(
+              seriesId: data.series.id,
+              chapterId: data.chapter.id,
+              readingListId: data.readingListId,
+            ),
+            .epub => EpubReader(
+              seriesId: data.series.id,
+              chapterId: data.chapter.id,
+              readingListId: data.readingListId,
+            ),
+            .pdf => PdfReader(
+              seriesId: data.series.id,
+              chapterId: data.chapter.id,
+              readingListId: data.readingListId,
+            ),
+            _ => Center(
+              child: Column(
+                mainAxisAlignment: .center,
+                crossAxisAlignment: .center,
+                spacing: LayoutConstants.mediumPadding,
+                children: [
+                  Icon(
+                    KoverIcons.error,
+                    size: LayoutConstants.largeIcon,
+                    color: Theme.of(context).colorScheme.error,
+                  ),
+                  Text(
+                    l.unsupportedFormat(
+                      data.series.format.name.toUpperCase(),
+                    ),
+                  ),
+                  FilledButton(
+                    onPressed: () => context.pop(),
+                    child: Text(l.back),
+                  ),
+                ],
+              ),
+            ),
           },
         );
       },
-      child: Async(
-        asyncValue: reader,
-        data: (data) {
-          return _ReaderSystemChrome(
-            seriesId: seriesId,
-            child: switch (data.series.format) {
-              .archive || .image => ImageReader(
-                seriesId: data.series.id,
-                chapterId: data.chapter.id,
-                readingListId: data.readingListId,
-              ),
-              .epub => EpubReader(
-                seriesId: data.series.id,
-                chapterId: data.chapter.id,
-                readingListId: data.readingListId,
-              ),
-              .pdf => PdfReader(
-                seriesId: data.series.id,
-                chapterId: data.chapter.id,
-                readingListId: data.readingListId,
-              ),
-              _ => Center(
-                child: Column(
-                  mainAxisAlignment: .center,
-                  crossAxisAlignment: .center,
-                  spacing: LayoutConstants.mediumPadding,
-                  children: [
-                    Icon(
-                      KoverIcons.error,
-                      size: LayoutConstants.largeIcon,
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                    Text(
-                      l.unsupportedFormat(
-                        data.series.format.name.toUpperCase(),
-                      ),
-                    ),
-                    FilledButton(
-                      onPressed: () => context.pop(),
-                      child: Text(l.back),
-                    ),
-                  ],
-                ),
-              ),
-            },
-          );
-        },
-        error: (_, _) => Center(
-          child: Column(
-            mainAxisAlignment: .center,
-            crossAxisAlignment: .center,
-            spacing: LayoutConstants.mediumPadding,
-            children: [
-              Icon(
-                KoverIcons.error,
-                size: LayoutConstants.largeIcon,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              TextButton(
-                onPressed: () => context.pop(),
-                child: Text(l.back),
-              ),
-            ],
-          ),
+      error: (_, _) => Center(
+        child: Column(
+          mainAxisAlignment: .center,
+          crossAxisAlignment: .center,
+          spacing: LayoutConstants.mediumPadding,
+          children: [
+            Icon(
+              KoverIcons.error,
+              size: LayoutConstants.largeIcon,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            TextButton(
+              onPressed: () => context.pop(),
+              child: Text(l.back),
+            ),
+          ],
         ),
       ),
     );

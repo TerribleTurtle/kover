@@ -1,342 +1,15 @@
 import 'dart:async';
 
-import 'package:flutter/widgets.dart';
-import 'package:flutter_animate/flutter_animate.dart';
 import 'package:freezed_annotation/freezed_annotation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:html/dom.dart';
-import 'package:kover/models/page_content.dart';
-import 'package:kover/riverpod/managers/font_manager.dart';
-import 'package:kover/riverpod/providers/book.dart';
-import 'package:kover/riverpod/providers/reader.dart';
 import 'package:kover/riverpod/providers/reader/reader.dart';
 import 'package:kover/riverpod/providers/reader/reader_navigation.dart';
-import 'package:kover/riverpod/providers/settings/common_reader_settings.dart';
 import 'package:kover/riverpod/providers/settings/epub_reader_settings.dart';
-import 'package:kover/riverpod/providers/theme.dart';
-import 'package:kover/utils/extensions/document_fragment.dart';
-import 'package:kover/utils/extensions/string.dart';
-import 'package:kover/utils/html_constants.dart';
 import 'package:kover/utils/logging.dart';
-import 'package:kover/utils/reflow_engine.dart';
-import 'package:kover/utils/headless_measure_pipeline.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
 part 'epub_reader.freezed.dart';
 part 'epub_reader.g.dart';
-
-typedef EpubMeasureWidgetBuilder = Widget Function(
-  String html,
-  Map<String, Map<String, String>> styles,
-);
-
-enum EpubReflowStatus {
-  initial,
-  measuring,
-  done,
-}
-
-@freezed
-sealed class EpubReflowState with _$EpubReflowState {
-  const EpubReflowState._();
-
-  const factory EpubReflowState({
-    required PageContent page,
-    @Default(EpubReflowStatus.initial) EpubReflowStatus status,
-    @Default(null) String? scrollId,
-    @Default(null) int? resumeSubpage,
-    @Default([]) List<DocumentFragment> subpages,
-  }) = _EpubReflowState;
-}
-
-@riverpod
-class EpubReflow extends _$EpubReflow {
-  final _pipeline = HeadlessMeasurePipeline();
-  Timer? _debounceReflow;
-  late EpubMeasureWidgetBuilder _measureBuilder;
-  late Duration _maxChunkDuration;
-  late ReflowEngine _cursor;
-
-  @override
-  Future<EpubReflowState> build({
-    required int seriesId,
-    required int chapterId,
-    required int page,
-  }) async {
-    ref.onDispose(() {
-      _debounceReflow?.cancel();
-      _pipeline.dispose();
-    });
-
-    // force rerender on settings change
-    ref.listen(epubReaderSettingsProvider(seriesId: seriesId), (prev, next) {
-      next.whenData((next) {
-        final partialPrev = prev?.value?.copyWith(
-          theme: next.theme,
-        );
-
-        // skip if the settings change doesn't affect the reflow
-        if (partialPrev == next) return;
-
-        ref.invalidateSelf(asReload: true);
-      });
-    });
-
-    final progressFuture = ref.read(
-      bookProgressProvider(chapterId: chapterId).future,
-    );
-    final settingsFuture = ref.read(
-      epubReaderSettingsProvider(seriesId: seriesId).future,
-    );
-    final pageContentFuture = ref.watch(
-      epubPageProvider(
-        chapterId: chapterId,
-        page: page,
-      ).future,
-    );
-    final fontManager = ref.read(fontManagerProvider.notifier);
-
-    final progress = await progressFuture;
-    final settings = await settingsFuture;
-    final pageContent = await pageContentFuture;
-
-    String? resumeScrollId;
-    if (progress != null && page == progress.pageNum) {
-      resumeScrollId = progress.bookScrollId;
-    }
-
-    if (settings.fontFamily != null) {
-      await fontManager.ensureServerFontLoaded(settings.fontFamily!);
-    }
-    await fontManager.ensureLoaded(pageContent.fonts);
-
-    final existingHighlight = pageContent.root.querySelector(
-      '.${HtmlConstants.resumeParagraphClass}',
-    );
-    if (existingHighlight != null) {
-      existingHighlight.classes.remove(HtmlConstants.resumeParagraphClass);
-    }
-
-    if (settings.highlightResumePoint && resumeScrollId != null) {
-      final resumePoint = pageContent.root.querySelector(
-        '[${HtmlConstants.scrollIdAttribute}="${resumeScrollId.cssEscaped}"]',
-      );
-      if (resumePoint != null && resumePoint.hasChildNodes()) {
-        resumePoint.classes.add(HtmlConstants.resumeParagraphClass);
-      }
-    }
-
-    _cursor = ExponentialBinaryReflowEngine(
-      root: pageContent.root.children.first,
-    );
-
-    return EpubReflowState(
-      page: pageContent,
-      scrollId: resumeScrollId,
-    );
-  }
-
-  /// Runs the reflow loop synchronously against the headless
-  /// [HeadlessMeasurePipeline] until the cursor is exhausted. Safe to call
-  /// repeatedly; concurrent calls are coalesced and viewport changes are
-  /// picked up by a running loop.
-  Future<void> startReflow({
-    required Size viewport,
-    required double devicePixelRatio,
-    required EpubMeasureWidgetBuilder measureBuilder,
-    required double refreshRate,
-  }) async {
-    _debounceReflow?.cancel();
-    _debounceReflow = Timer(200.ms, () {
-      _reflow(
-        viewport: viewport,
-        devicePixelRatio: devicePixelRatio,
-        measureBuilder: measureBuilder,
-        refreshRate: refreshRate,
-      );
-    });
-  }
-
-  Future<void> _reflow({
-    required Size viewport,
-    required double devicePixelRatio,
-    required EpubMeasureWidgetBuilder measureBuilder,
-    required double refreshRate,
-  }) async {
-    if (!ref.mounted || viewport.isEmpty) return;
-
-    _measureBuilder = measureBuilder;
-    final refreshRateClamped = refreshRate > 0 ? refreshRate : 30;
-    _maxChunkDuration = Duration(
-      milliseconds: (1000 / refreshRateClamped).round() ~/ 2,
-    );
-
-    if (!state.hasValue || state.value?.status != .initial) return;
-    state = AsyncData(state.value!.copyWith(status: .measuring));
-
-    // Ensure css is hot and ready
-    await ref.read(customCssProvider(seriesId: seriesId).future);
-
-    _pipeline.attach(size: viewport, devicePixelRatio: devicePixelRatio);
-
-    try {
-      if (!ref.mounted) return;
-
-      final stopwatch = Stopwatch()..start();
-
-      while (ref.mounted &&
-          _pipeline.isAttached &&
-          state.value?.status == .measuring) {
-        final maxHeight = _pipeline.viewportSize?.height ?? viewport.height;
-        final bufferHtml = _cursor.buffer.outerHtml;
-
-        final current = await future;
-        if (!ref.mounted ||
-            !_pipeline.isAttached ||
-            current.status != .measuring) {
-          return;
-        }
-
-        final height = _pipeline
-            .measure(_measureBuilder(bufferHtml, current.page.styles))
-            .height;
-
-        // A zero-height measure for non-empty content means the measure
-        // pass is silently broken; never treat it as "fits".
-        if (height == 0 &&
-            _cursor.buffer.hasVisibleNodes &&
-            bufferHtml.isNotEmpty) {
-          throw StateError(
-            'measure returned zero height for non-empty buffer',
-          );
-        }
-
-        if (height <= maxHeight) {
-          await _addElement();
-        } else {
-          await _handleOverflow();
-        }
-
-        // Yield to the event loop periodically to keep the UI responsive.
-        if (stopwatch.elapsed >= _maxChunkDuration) {
-          stopwatch.reset();
-          await Future<void>.delayed(0.ms);
-        }
-      }
-    } on MeasureTreeBuildException catch (e, stacktrace) {
-      log.error(
-        'measure widget failed to build',
-        error: e,
-        stacktrace: stacktrace,
-      );
-      if (ref.mounted) {
-        state = AsyncError(e, stacktrace);
-      }
-    }
-  }
-
-  Future<void> _addElement() async {
-    final current = state.value;
-    if (current == null || current.status == .done) return;
-
-    final next = _cursor.addNext();
-    if (next) return;
-
-    final tail = DocumentFragment()..append(_cursor.buffer.clone(true));
-    final newSubpages = [
-      ...current.subpages,
-      tail,
-    ].where((fragment) => fragment.hasVisibleNodes).toList();
-
-    if (newSubpages.isEmpty) {
-      log.debug('no content to render, add empty page');
-      newSubpages.add(DocumentFragment());
-    }
-
-    var newState = current.copyWith(
-      subpages: newSubpages,
-      status: .done,
-    );
-
-    newState = await _checkResumePoint(
-      current: newState,
-      fragment: tail,
-      subpage: newSubpages.length - 1,
-    );
-
-    // The state was replaced (reload or a newer run) while awaiting; never
-    // clobber it with a stale pagination.
-    if (!identical(state.value, current)) return;
-
-    state = AsyncData(newState);
-  }
-
-  Future<void> _handleOverflow() async {
-    final current = state.value;
-    if (current == null || current.status == .done) return;
-
-    if (_cursor.overflow()) return;
-
-    final newSubpageNode = _cursor.commitSplit();
-
-    final fragment = DocumentFragment()..append(newSubpageNode);
-    final newSubpages = [
-      ...current.subpages,
-      if (fragment.hasVisibleNodes) fragment,
-    ];
-
-    var newState = current.copyWith(
-      subpages: newSubpages,
-    );
-
-    newState = await _checkResumePoint(
-      current: newState,
-      fragment: fragment,
-      subpage: newSubpages.length - 1,
-    );
-
-    // The state was replaced (reload or a newer run) while awaiting; never
-    // clobber it with a stale pagination.
-    if (!identical(state.value, current)) return;
-
-    state = AsyncData(newState);
-  }
-
-  Future<EpubReflowState> _checkResumePoint({
-    required EpubReflowState current,
-    required DocumentFragment fragment,
-    required int subpage,
-  }) async {
-    EpubReflowState? newState;
-    if (current.scrollId != null) {
-      try {
-        final resumePoint = fragment.querySelector(
-          '[${HtmlConstants.scrollIdAttribute}="${current.scrollId!.cssEscaped}"]',
-        );
-        if (resumePoint != null && resumePoint.hasChildNodes()) {
-          log.info(
-            'found resume point',
-            attributes: {
-              'scroll_id': current.scrollId,
-            },
-          );
-
-          newState = current.copyWith(
-            scrollId: null,
-            resumeSubpage: subpage,
-          );
-        }
-      } catch (e, stacktrace) {
-        log.error(
-          'failed to find resume point in new subpage',
-          error: e,
-          stacktrace: stacktrace,
-        );
-      }
-    }
-    return newState ?? current;
-  }
-}
 
 @freezed
 sealed class EpubNavigationState with _$EpubNavigationState {
@@ -347,15 +20,16 @@ sealed class EpubNavigationState with _$EpubNavigationState {
     required int totalSubpages,
     @Default(false) bool ready,
     @Default(false) bool fromObserver,
+    @Default(null) String? scrollId,
+    @Default(null) String? pendingAnchorId,
   }) = _EpubNavigationState;
 }
 
 @riverpod
 class EpubNavigation extends _$EpubNavigation {
-  ProviderSubscription<AsyncValue<EpubReflowState>>? _reflowSub;
-  var _fromLastSubpage = false;
-  var _resumed = false;
-  var _wasAheadReflow = false;
+  final Map<int, int> _pageSubpageCounts = {};
+  int? _pendingLastSubpagePage;
+  String? _pendingAnchorId;
   var _spreads = false;
   int get _step => _spreads ? 2 : 1;
 
@@ -396,46 +70,51 @@ class EpubNavigation extends _$EpubNavigation {
     );
   }
 
+  void updateSubpageCount(int page, int totalSubpages) {
+    _pageSubpageCounts[page] = totalSubpages;
+
+    final current = state.value;
+    if (current == null || current.page != page) return;
+
+    final landOnLast = _pendingLastSubpagePage == page;
+    if (landOnLast) {
+      _pendingLastSubpagePage = null;
+    }
+
+    final subpage = landOnLast && totalSubpages > 0
+        ? totalSubpages - 1
+        : current.subpage;
+
+    // Avoid redundant state writes: listeners would sync the same subpage back
+    // into the page controller and start a notification loop.
+    if (current.ready &&
+        current.totalSubpages == totalSubpages &&
+        current.subpage == subpage) {
+      return;
+    }
+
+    state = AsyncData(
+      current.copyWith(
+        totalSubpages: totalSubpages,
+        subpage: subpage,
+        ready: true,
+      ),
+    );
+  }
+
   void _handleProgress() {
     listenSelf((prev, next) {
       next.whenData((data) async {
-        final reflow = await ref.read(
-          epubReflowProvider(
-            seriesId: seriesId,
-            chapterId: chapterId,
-            page: data.page,
-          ).future,
-        );
-
-        final isAheadReflow = reflow.subpages.length <= data.subpage;
         final isSamePosition =
-            _wasAheadReflow == isAheadReflow &&
             prev?.value?.page == data.page &&
-            prev?.value?.subpage == data.subpage;
-        _wasAheadReflow = isAheadReflow;
+            prev?.value?.subpage == data.subpage &&
+            prev?.value?.scrollId == data.scrollId;
 
-        if (!data.ready || isAheadReflow || isSamePosition) return;
-
-        final scrollId = reflow.subpages[data.subpage].paragraphScrollId();
+        if (!data.ready || isSamePosition) return;
 
         final isLastSubpage = _spreads
             ? data.subpage >= data.totalSubpages - 2
             : data.subpage >= data.totalSubpages - 1;
-
-        if (reflow.status == .done &&
-            data.page >= data.totalPages - 1 &&
-            isLastSubpage) {
-          await ref
-              .read(
-                readerProvider(
-                  seriesId: seriesId,
-                  chapterId: chapterId,
-                  readingListId: readingListId,
-                ).notifier,
-              )
-              .markComplete();
-          return;
-        }
 
         try {
           final reader = ref.read(
@@ -447,8 +126,8 @@ class EpubNavigation extends _$EpubNavigation {
           );
           await reader.saveProgress(
             page: data.page,
-            scrollId: scrollId,
-            handleCompletion: false,
+            scrollId: data.scrollId,
+            handleCompletion: isLastSubpage,
           );
         } catch (e, stacktrace) {
           log.error(
@@ -472,26 +151,29 @@ class EpubNavigation extends _$EpubNavigation {
         next.whenData(
           (next) async {
             final current = await future;
+            final cachedCount = _pageSubpageCounts[next];
+            final landOnLast = _pendingLastSubpagePage == next;
+            final subpage = landOnLast && cachedCount != null && cachedCount > 0
+                ? cachedCount - 1
+                : 0;
 
-            if (prev != null &&
-                prev.hasValue &&
-                (next - prev.value!).abs() > 1) {
-              _fromLastSubpage = false;
+            if (!landOnLast || cachedCount != null) {
+              _pendingLastSubpagePage = null;
             }
+
+            final pendingAnchor = _pendingAnchorId;
+            _pendingAnchorId = null;
 
             state = AsyncData(
               current.copyWith(
                 page: next,
-                subpage: 0,
-                ready: false,
+                subpage: subpage,
+                totalSubpages: cachedCount ?? 0,
+                ready: cachedCount != null,
                 fromObserver: false,
+                scrollId: null,
+                pendingAnchorId: pendingAnchor,
               ),
-            );
-
-            _handleReflowChanges(
-              seriesId: seriesId,
-              chapterId: chapterId,
-              page: next,
             );
           },
         );
@@ -509,84 +191,31 @@ class EpubNavigation extends _$EpubNavigation {
         .handleCompletion(false);
   }
 
-  void _handleReflowChanges({
-    required int seriesId,
-    required int chapterId,
-    required int page,
-  }) {
-    _reflowSub?.close();
-    _reflowSub = ref.listen(
-      epubReflowProvider(
-        seriesId: seriesId,
-        chapterId: chapterId,
-        page: page,
-      ),
-      (prev, next) {
-        if (next.isLoading && prev?.hasValue == true) {
-          _resumed = false;
-          ref.invalidateSelf(asReload: true);
-          return;
-        }
-        next.whenData((data) async {
-          final current = await future;
-
-          if (data.status == .measuring && prev?.value?.status == .done) {
-            _resumed = false;
-            state = AsyncData(
-              current.copyWith(
-                subpage: 0,
-                totalSubpages: data.subpages.length,
-                ready: false,
-              ),
-            );
-            return;
-          }
-
-          if (_fromLastSubpage) {
-            if (data.status == .done) {
-              state = AsyncData(
-                current.copyWith(
-                  subpage: data.subpages.length - 1,
-                  totalSubpages: data.subpages.length,
-                  ready: true,
-                ),
-              );
-              _fromLastSubpage = false;
-            }
-            return;
-          }
-
-          if (!_resumed && data.resumeSubpage != null) {
-            _resumed = true;
-            state = AsyncData(
-              current.copyWith(
-                subpage: data.resumeSubpage!,
-                totalSubpages: data.subpages.length,
-                ready: true,
-              ),
-            );
-            return;
-          }
-
-          state = AsyncData(
-            current.copyWith(
-              totalSubpages: data.subpages.length,
-              ready: data.status == .done || data.scrollId == null,
-            ),
-          );
-        });
-      },
-      fireImmediately: true,
-    );
-  }
-
-  Future<void> jumpToPage(int page) async {
+  Future<void> jumpToPage(
+    int page, {
+    bool force = false,
+    bool landOnLastSubpage = false,
+    String? anchorId,
+  }) async {
     final current = await future;
 
-    if (!current.ready || page >= current.totalPages || page < 0) return;
+    if ((!current.ready && !force) || page >= current.totalPages || page < 0) {
+      return;
+    }
 
-    if (current.page - page == 1) {
-      _fromLastSubpage = true;
+    if (landOnLastSubpage) {
+      _pendingLastSubpagePage = page;
+    } else {
+      _pendingLastSubpagePage = null;
+    }
+
+    _pendingAnchorId = anchorId;
+
+    if (page == current.page) {
+      if (anchorId != null) {
+        state = AsyncData(current.copyWith(pendingAnchorId: anchorId));
+      }
+      return;
     }
 
     await ref
@@ -600,25 +229,41 @@ class EpubNavigation extends _$EpubNavigation {
         .jumpToPage(page);
   }
 
-  Future<void> jumpToSubpage(int subpage, {bool fromObserver = false}) async {
+  Future<void> jumpToLink({int? page, String? anchorId}) async {
+    final current = await future;
+    final targetPage = page ?? current.page;
+    await jumpToPage(
+      targetPage,
+      force: true,
+      anchorId: anchorId,
+    );
+  }
+
+  void clearPendingAnchor() {
+    _pendingAnchorId = null;
+    final current = state.value;
+    if (current != null && current.pendingAnchorId != null) {
+      state = AsyncData(current.copyWith(pendingAnchorId: null));
+    }
+  }
+
+  Future<void> jumpToSubpage(
+    int subpage, {
+    bool fromObserver = false,
+    String? scrollId,
+    int? page,
+  }) async {
     final current = await future;
 
+    if (page != null && current.page != page) return;
     if (!current.ready) return;
 
-    final reflow = await ref.read(
-      epubReflowProvider(
-        seriesId: seriesId,
-        chapterId: chapterId,
-        page: current.page,
-      ).future,
-    );
-
     if (subpage < 0) {
-      await jumpToPage(current.page - 1);
+      await jumpToPage(current.page - 1, landOnLastSubpage: true);
       return;
     }
 
-    if (reflow.status == .done && subpage >= reflow.subpages.length) {
+    if (subpage >= current.totalSubpages) {
       await jumpToPage(current.page + 1);
       return;
     }
@@ -626,85 +271,31 @@ class EpubNavigation extends _$EpubNavigation {
     state = AsyncData(
       current.copyWith(
         subpage: subpage,
-        ready: reflow.status == .done || subpage < reflow.subpages.length,
         fromObserver: fromObserver,
+        scrollId: scrollId,
       ),
     );
   }
 
   Future<void> nextPage() async {
     final current = await future;
+
+    if (!current.ready) {
+      await jumpToPage(current.page + 1, force: true);
+      return;
+    }
+
     await jumpToSubpage(current.subpage + _step);
   }
 
   Future<void> previousPage() async {
     final current = await future;
+
+    if (!current.ready) {
+      await jumpToPage(current.page - 1, force: true, landOnLastSubpage: true);
+      return;
+    }
+
     await jumpToSubpage(current.subpage - _step);
   }
-}
-
-@freezed
-sealed class EpubReaderSubpageState with _$EpubReaderSubpageState {
-  const factory EpubReaderSubpageState({
-    required EpubNavigationState navigation,
-    required EpubReflowState reflow,
-    required EpubReaderMode mode,
-    required double paragraphSpacing,
-    required bool reverse,
-    required bool navigationGesturesEnabled,
-    required bool reduceAnimations,
-  }) = _EpubReaderSubpageState;
-}
-
-@riverpod
-Future<EpubReaderSubpageState> epubReaderSubpage(
-  Ref ref, {
-  required int seriesId,
-  required int chapterId,
-  required int? readingListId,
-  required int page,
-}) async {
-  final navigationFuture = ref.watch(
-    epubNavigationProvider(
-      seriesId: seriesId,
-      chapterId: chapterId,
-      readingListId: readingListId,
-    ).future,
-  );
-  final reflowFuture = ref.watch(
-    epubReflowProvider(
-      seriesId: seriesId,
-      chapterId: chapterId,
-      page: page,
-    ).future,
-  );
-  final epubSettingsFuture = ref.watch(
-    epubReaderSettingsProvider(seriesId: seriesId).selectAsync(
-      (value) => (value.mode, value.paragraphSpacing),
-    ),
-  );
-  final commonSettingsFuture = ref.watch(
-    commonReaderSettingsProvider(seriesId: seriesId).selectAsync(
-      (value) => (value.navigationGersturesEnabled, value.readDirection),
-    ),
-  );
-  final reduceAnimationsFuture = ref.watch(
-    themeProvider.selectAsync((value) => value.reduceAnimations),
-  );
-
-  final reflow = await reflowFuture;
-  final navigation = await navigationFuture;
-  final (mode, paragraphSpacing) = await epubSettingsFuture;
-  final (navigationGestures, readDirection) = await commonSettingsFuture;
-  final reduceAnimations = await reduceAnimationsFuture;
-
-  return EpubReaderSubpageState(
-    navigation: navigation,
-    reflow: reflow,
-    mode: mode,
-    paragraphSpacing: paragraphSpacing,
-    reverse: readDirection == .rightToLeft,
-    navigationGesturesEnabled: navigationGestures,
-    reduceAnimations: reduceAnimations,
-  );
 }

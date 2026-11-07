@@ -136,25 +136,7 @@ class ReaderRepository {
       ),
     );
 
-    try {
-      await _readerClient.sendProgress(prog);
-    } catch (e, stacktrace) {
-      log.error(
-        'could not send progress',
-        error: e,
-        stacktrace: stacktrace,
-        attributes: {
-          'chapter_id': prog.chapterId,
-          'volume_id': prog.volumeId,
-          'series_id': prog.seriesId,
-          'library_id': prog.libraryId,
-          'pages_read': prog.pagesRead,
-          'book_scroll_id': prog.bookScrollId ?? 'null',
-          'last_modified': prog.lastModified.toIso8601String(),
-          'dirty': prog.dirty,
-        },
-      );
-    }
+    await _sendProgress(prog);
   }
 
   /// Refresh complete progress for all series that have newer reading progress
@@ -301,11 +283,35 @@ class ReaderRepository {
 
   /// Mark [chapterId] as read.
   Future<void> markChapterRead(int chapterId) async {
-    await _db.readerDao.markChapterRead(chapterId, isRead: true);
+    final prog = await _db.readerDao.markChapterRead(chapterId, isRead: true);
+    await _sendProgress(prog);
   }
 
   /// Mark [chapterId] as unread.
   Future<void> markChapterUnread(int chapterId) async {
-    await _db.readerDao.markChapterRead(chapterId, isRead: false);
+    final prog = await _db.readerDao.markChapterRead(chapterId, isRead: false);
+    await _sendProgress(prog);
+  }
+
+  Future<void> _sendProgress(ReadingProgressData prog) async {
+    try {
+      await _readerClient.sendProgress(prog);
+    } catch (e, stacktrace) {
+      log.error(
+        'could not send progress',
+        error: e,
+        stacktrace: stacktrace,
+        attributes: {
+          'chapter_id': prog.chapterId,
+          'volume_id': prog.volumeId,
+          'series_id': prog.seriesId,
+          'library_id': prog.libraryId,
+          'pages_read': prog.pagesRead,
+          'book_scroll_id': prog.bookScrollId ?? 'null',
+          'last_modified': prog.lastModified.toIso8601String(),
+          'dirty': prog.dirty,
+        },
+      );
+    }
   }
 }

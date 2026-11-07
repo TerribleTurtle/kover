@@ -82,6 +82,13 @@ class Reader extends _$Reader {
     required int chapterId,
     required int? readingListId,
   }) async {
+    final syncManager = ref.read(syncManagerProvider.notifier);
+    ref.onDispose(() {
+      _saveProgressDebounce?.cancel();
+      _saveProgressKeepAlive?.close();
+      syncManager.syncProgress();
+    });
+
     final seriesFuture = ref.read(
       readerSeriesProvider(seriesId: seriesId).future,
     );

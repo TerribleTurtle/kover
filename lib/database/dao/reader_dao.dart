@@ -447,6 +447,7 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: isRead ? const Value.absent() : const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         );
@@ -455,6 +456,8 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
       await batch((batch) {
         batch.insertAllOnConflictUpdate(readingProgress, progressBatch);
       });
+
+      await db.seriesDao.clearOnDeckRemovalForSeries(seriesId);
     });
   }
 
@@ -484,20 +487,30 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: isRead ? const Value.absent() : const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         );
-      });
+      }).toList();
 
       await batch((batch) {
         batch.insertAllOnConflictUpdate(readingProgress, progressBatch);
       });
+
+      if (progressBatch.isNotEmpty) {
+        await db.seriesDao.clearOnDeckRemovalForSeries(
+          progressBatch.first.seriesId.value,
+        );
+      }
     });
   }
 
   /// Mark chapter [chapterId] as [isRead]
-  Future<void> markChapterRead(int chapterId, {required bool isRead}) async {
-    await transaction(() async {
+  Future<ReadingProgressData> markChapterRead(
+    int chapterId, {
+    required bool isRead,
+  }) async {
+    return transaction(() async {
       final join =
           await (select(
             chapters,
@@ -508,15 +521,14 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
       final c = join.readTable(chapters);
       final s = join.readTable(series);
 
-      await into(
-        readingProgress,
-      ).insertOnConflictUpdate(
+      return upsertProgress(
         ReadingProgressCompanion(
           chapterId: Value(c.id),
           volumeId: Value(c.volumeId),
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: isRead ? const Value.absent() : const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         ),

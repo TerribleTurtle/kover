@@ -1,3 +1,4 @@
+import 'package:collection/collection.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:kover/widgets/settings/option_container.dart';
 
@@ -22,8 +23,8 @@ class ChoiceOption<T> extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final selectedIcon = options
-        .firstWhere((option) => option.value == value)
-        .icon;
+        .firstWhereOrNull((option) => option.value == value)
+        ?.icon;
 
     return OptionContainer(
       title: title,

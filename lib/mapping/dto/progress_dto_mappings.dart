@@ -11,7 +11,7 @@ extension ProgressDtoMappings on ProgressDto {
       seriesId: Value(seriesId),
       libraryId: Value(libraryId),
       pagesRead: Value(pageNum),
-      bookScrollId: Value(bookScrollId),
+      bookScrollId: Value(pageNum > 0 ? bookScrollId : null),
       lastModified: Value.absentIfNull(lastModifiedUtc?.normalizeUtc()),
       dirty: const Value(false),
     );

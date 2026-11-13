@@ -21,7 +21,40 @@ part 'reader_dao.g.dart';
   ],
 )
 class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
+  static const double _looseVolumeMinNumber = 99999;
+  static const double _specialVolumeMinNumber = 100000;
+
   ReaderDao(super.attachedDatabase);
+
+  /// Effective volume ordering key placing numbered volumes before unvolumed
+  /// loose chapters and specials last.
+  Expression<double> get _effectiveVolumeMinNumber => coalesce([
+    volumes.minNumber,
+    CaseWhenExpression<double>(
+      cases: [
+        CaseWhen(
+          chapters.isSpecial,
+          then: const Constant(_specialVolumeMinNumber),
+        ),
+      ],
+      orElse: const Constant(_looseVolumeMinNumber),
+    ),
+  ]);
+
+  Expression<double> _sortOrderOf(int chapterId) => subqueryExpression<double>(
+    selectOnly(chapters)
+      ..addColumns([chapters.sortOrder])
+      ..where(chapters.id.equals(chapterId)),
+  );
+
+  Expression<double> _volumeMinNumberOf(int chapterId) =>
+      subqueryExpression<double>(
+        selectOnly(chapters).join([
+            leftOuterJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
+          ])
+          ..addColumns([_effectiveVolumeMinNumber])
+          ..where(chapters.id.equals(chapterId)),
+      );
 
   JoinedSelectStatement<HasResultSet, dynamic> _chaptersWithProgressQuery({
     required int seriesId,
@@ -59,8 +92,9 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           readingProgress.chapterId.isNull() |
               readingProgress.pagesRead.equals(0),
         ),
-        .asc(volumes.minNumber),
+        .asc(_effectiveVolumeMinNumber),
         .asc(chapters.sortOrder),
+        .asc(chapters.id),
       ])
       ..limit(1);
   }
@@ -169,8 +203,8 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
   /// [seriesId] and/or chapters that have never been fetched locally
   /// ([onlyMissing]).
   ///
-  /// When [onlyMissing] is false, EPUB progress entries without an xpath are
-  /// included as well so their full progress can be fetched.
+  /// When [onlyMissing] is false, clean partial EPUB progress entries without
+  /// an xpath and remote unread resets are included as well.
   Future<List<int>> getOutdatedChapterIds({
     int? seriesId,
     bool onlyMissing = false,
@@ -182,13 +216,21 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
     );
     final isPartialEpubCandidate =
         chapters.format.equalsValue(.epub) &
+        readingProgress.dirty.equals(false) &
+        readingProgress.pagesRead.isBiggerThanValue(0) &
+        readingProgress.pagesRead.isSmallerThan(chapters.pages) &
         readingProgress.bookScrollId.isNull();
+    final isRemoteResetToUnread =
+        chapters.remotePagesRead.equals(0) &
+        readingProgress.dirty.equals(false) &
+        readingProgress.pagesRead.isBiggerThanValue(0) &
+        isLocalOutdated;
 
-    var condition =
-        hasRemoteProgress &
-        (onlyMissing
-            ? isMissingLocal
-            : (isMissingLocal | isLocalOutdated | isPartialEpubCandidate));
+    var condition = onlyMissing
+        ? (hasRemoteProgress & isMissingLocal)
+        : ((hasRemoteProgress &
+                  (isMissingLocal | isLocalOutdated | isPartialEpubCandidate)) |
+              isRemoteResetToUnread);
 
     if (seriesId != null) {
       condition = condition & chapters.seriesId.equals(seriesId);
@@ -238,7 +280,9 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           onConflict: DoUpdate((old) => entry),
         );
 
-    await db.seriesDao.clearOnDeckRemovalForSeries(entry.seriesId.value);
+    if (progress.pagesRead > 0) {
+      await db.seriesDao.clearOnDeckRemovalForSeries(progress.seriesId);
+    }
 
     return progress;
   }
@@ -268,9 +312,16 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
         b.insertAllOnConflictUpdate(readingProgress, toUpdate);
       });
 
-      await db.seriesDao.clearOnDeckRemovalForSeriesBatch(
-        toUpdate.map((entry) => entry.seriesId.value),
-      );
+      final readSeriesIds = {
+        for (final entry in toUpdate)
+          if (entry.pagesRead.present &&
+              entry.pagesRead.value > 0 &&
+              entry.seriesId.present)
+            entry.seriesId.value,
+      };
+      if (readSeriesIds.isNotEmpty) {
+        await db.seriesDao.clearOnDeckRemovalForSeriesBatch(readSeriesIds);
+      }
     }
 
     return await managers.readingProgress
@@ -292,34 +343,30 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
     int? readingListId,
   }) {
     if (readingListId == null) {
-      final sortOrderOfCurrent = subqueryExpression<double>(
-        selectOnly(chapters)
-          ..addColumns([chapters.sortOrder])
-          ..where(chapters.id.equals(chapterId)),
-      );
-      final volumeMinNumberOfCurrent = subqueryExpression<double>(
-        selectOnly(chapters).join([
-            innerJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
-          ])
-          ..addColumns([volumes.minNumber])
-          ..where(chapters.id.equals(chapterId)),
-      );
+      final sortOrderOfCurrent = _sortOrderOf(chapterId);
+      final volumeMinNumberOfCurrent = _volumeMinNumberOf(chapterId);
+      final effectiveVolumeMin = _effectiveVolumeMinNumber;
 
       final query =
           select(chapters).join([
-              innerJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
+              leftOuterJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
             ])
             ..where(
               chapters.seriesId.equals(seriesId) &
-                  (volumes.minNumber.isSmallerThan(volumeMinNumberOfCurrent) |
-                      (volumes.minNumber.equalsExp(volumeMinNumberOfCurrent) &
-                          chapters.sortOrder.isSmallerThan(
-                            sortOrderOfCurrent,
-                          ))),
+                  (effectiveVolumeMin.isSmallerThan(volumeMinNumberOfCurrent) |
+                      (effectiveVolumeMin.equalsExp(volumeMinNumberOfCurrent) &
+                          (chapters.sortOrder.isSmallerThan(
+                                sortOrderOfCurrent,
+                              ) |
+                              (chapters.sortOrder.equalsExp(
+                                    sortOrderOfCurrent,
+                                  ) &
+                                  chapters.id.isSmallerThanValue(chapterId))))),
             )
             ..orderBy([
-              .desc(volumes.minNumber),
+              .desc(effectiveVolumeMin),
               .desc(chapters.sortOrder),
+              .desc(chapters.id),
             ])
             ..limit(1);
 
@@ -364,34 +411,30 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
     int? readingListId,
   }) {
     if (readingListId == null) {
-      final sortOrderOfCurrent = subqueryExpression<double>(
-        selectOnly(chapters)
-          ..addColumns([chapters.sortOrder])
-          ..where(chapters.id.equals(chapterId)),
-      );
-      final volumeMinNumberOfCurrent = subqueryExpression<double>(
-        selectOnly(chapters).join([
-            innerJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
-          ])
-          ..addColumns([volumes.minNumber])
-          ..where(chapters.id.equals(chapterId)),
-      );
+      final sortOrderOfCurrent = _sortOrderOf(chapterId);
+      final volumeMinNumberOfCurrent = _volumeMinNumberOf(chapterId);
+      final effectiveVolumeMin = _effectiveVolumeMinNumber;
 
       final query =
           select(chapters).join([
-              innerJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
+              leftOuterJoin(volumes, volumes.id.equalsExp(chapters.volumeId)),
             ])
             ..where(
               chapters.seriesId.equals(seriesId) &
-                  (volumes.minNumber.isBiggerThan(volumeMinNumberOfCurrent) |
-                      (volumes.minNumber.equalsExp(volumeMinNumberOfCurrent) &
-                          chapters.sortOrder.isBiggerThan(
-                            sortOrderOfCurrent,
-                          ))),
+                  (effectiveVolumeMin.isBiggerThan(volumeMinNumberOfCurrent) |
+                      (effectiveVolumeMin.equalsExp(volumeMinNumberOfCurrent) &
+                          (chapters.sortOrder.isBiggerThan(
+                                sortOrderOfCurrent,
+                              ) |
+                              (chapters.sortOrder.equalsExp(
+                                    sortOrderOfCurrent,
+                                  ) &
+                                  chapters.id.isBiggerThanValue(chapterId))))),
             )
             ..orderBy([
-              .asc(volumes.minNumber),
+              .asc(effectiveVolumeMin),
               .asc(chapters.sortOrder),
+              .asc(chapters.id),
             ])
             ..limit(1);
 
@@ -447,6 +490,7 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         );
@@ -455,6 +499,10 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
       await batch((batch) {
         batch.insertAllOnConflictUpdate(readingProgress, progressBatch);
       });
+
+      if (isRead) {
+        await db.seriesDao.clearOnDeckRemovalForSeries(seriesId);
+      }
     });
   }
 
@@ -474,7 +522,8 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
                 innerJoin(series, series.id.equalsExp(chapters.seriesId)),
               ]);
 
-      final progressBatch = (await query.get()).map((join) {
+      final rows = await query.get();
+      final progressBatch = rows.map((join) {
         final c = join.readTable(chapters);
         final s = join.readTable(series);
 
@@ -484,6 +533,7 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         );
@@ -492,6 +542,12 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
       await batch((batch) {
         batch.insertAllOnConflictUpdate(readingProgress, progressBatch);
       });
+
+      if (isRead && rows.isNotEmpty) {
+        await db.seriesDao.clearOnDeckRemovalForSeries(
+          rows.first.readTable(series).id,
+        );
+      }
     });
   }
 
@@ -517,10 +573,15 @@ class ReaderDao extends DatabaseAccessor<AppDatabase> with _$ReaderDaoMixin {
           seriesId: Value(s.id),
           libraryId: Value(s.libraryId),
           pagesRead: Value(isRead ? c.pages : 0),
+          bookScrollId: const Value(null),
           lastModified: Value(DateTime.timestamp()),
           dirty: const Value(true),
         ),
       );
+
+      if (isRead) {
+        await db.seriesDao.clearOnDeckRemovalForSeries(s.id);
+      }
     });
   }
 

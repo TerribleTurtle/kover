@@ -167,6 +167,33 @@ void main() {
           ]),
         );
       });
+
+      testWidgets('non-block widgets keep measurements', (tester) async {
+        final html = _preprocess(
+          '<div>'
+          '<h1><ruby>序章<rt>プロローグ</rt></ruby></h1>'
+          '<h2><span style="display: inline-block">Part I</span></h2>'
+          '<h3><span style="border: 1px solid">Tag</span></h3>'
+          '<div class="box" style="display: inline-block">Callout</div>'
+          '<p style="text-emphasis: sesame">強調文</p>'
+          '<ol><li class="a">Alpha</li><li class="b">Beta</li></ol>'
+          '</div>',
+        );
+        final result = await _measure(tester, html);
+        final units = result.measurements.units;
+        final baseHeight = tester
+            .getSize(find.text('序章', findRichText: true))
+            .height;
+
+        expect(
+          [for (final u in units) u.nodeIndex],
+          [
+            for (final s in 'h1,h2,h3,.box,p,.a,.b'.split(','))
+              _nodeIndex(html, s),
+          ],
+        );
+        expect(units.first.height, greaterThan(baseHeight));
+      });
     });
 
     testWidgets('empty block yields a leaf unit', (tester) async {
@@ -194,6 +221,37 @@ void main() {
         final lines = await _paddedLines(tester);
 
         expect(lines.last.bottomInset, greaterThanOrEqualTo(32));
+      });
+    });
+
+    group('stylesheet rules', () {
+      testWidgets('inline widgets and stylesheet rules yield line units', (
+        tester,
+      ) async {
+        final html = _preprocess(
+          '<style>'
+          '.r{display:inline-block} a{vertical-align:super} '
+          'b{border-bottom:1px dotted} .h{display:none}'
+          '</style>'
+          '<div>'
+          '<p>H<sub>2</sub>O and <a id="n">1</a> <b>t</b> '
+          '<span class="h">x</span></p>'
+          '<p><ruby>山<rp>(</rp><rt>や</rt><rp>)</rp></ruby> '
+          '<ruby>漢<rt>か</rt>字<rt>じ</rt></ruby> '
+          '<ruby class="r">漢<rt>か</rt>字<rt>じ</rt></ruby></p>'
+          '<p><span style="margin:1em 0;padding:0">A</span>'
+          '<span style="padding:0 4px">B</span></p>'
+          '</div>',
+        );
+        final result = await _measure(tester, html);
+        final units = result.measurements.units;
+        final expected = [
+          for (final p in html.querySelectorAll('p'))
+            int.parse(p.attributes[HtmlConstants.nodeIndexAttribute]!),
+        ];
+
+        expect(units.whereType<EpubLeafUnit>(), isEmpty);
+        expect({for (final u in units) u.nodeIndex}, containsAll(expected));
       });
     });
   });

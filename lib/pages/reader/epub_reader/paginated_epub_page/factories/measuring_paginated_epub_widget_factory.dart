@@ -3,6 +3,7 @@ import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/factories/paginated_epub_widget_factory.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/measure/epub_probe.dart';
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/measure/epub_text_index.dart';
 import 'package:kover/utils/constants/html_constants.dart';
 
 /// A [WidgetFactory] used for measuring the epub content.
@@ -12,6 +13,11 @@ class MeasuringPaginatedEpubWidgetFactory({
   super.removeParagraphIndent,
   final void Function()? onChanged,
 }) extends PaginatedEpubWidgetFactory {
+  // Matches fwfh's internal Priority.max so _probeOp and _inlineOp run after
+  // Late ops.
+  static const _afterLateBuildOpPriority = 9007199254740991;
+
+  final Map<dom.Element, EpubInlineMeta> _inlineMeta = {};
   var _isBuildComplete = false;
   int _pendingImages = 0;
 
@@ -23,6 +29,8 @@ class MeasuringPaginatedEpubWidgetFactory({
     debugLabel: 'epub-block-probe',
     priority: 9999,
     onRenderBlock: (tree, placeholder) {
+      if (tree.isInline == true) return placeholder;
+
       final nodeIndex = _nodeIndex(tree.element);
       if (nodeIndex == null) return placeholder;
 
@@ -35,10 +43,66 @@ class MeasuringPaginatedEpubWidgetFactory({
   );
 
   @override
+  void reset(State state) {
+    super.reset(state);
+    _inlineMeta.clear();
+  }
+
+  @override
   void parse(BuildTree meta) {
     meta.register(epubBlockProbeOp);
+    meta.register(_probeOp(meta));
+    meta.register(_inlineOp(meta));
 
     super.parse(meta);
+  }
+
+  BuildOp _probeOp(BuildTree meta) {
+    final node = meta.element;
+    final nodeIndex = _nodeIndex(node);
+    return .v2(
+      priority: _afterLateBuildOpPriority - 1,
+      onParsed: (tree) {
+        if (identical(tree, meta) || tree.isEmpty || nodeIndex == null) {
+          return tree;
+        }
+        if (meta.isInline == false) {
+          tree.register(epubBlockProbeOp);
+          return tree;
+        }
+        if (tree.children.singleOrNull case final WidgetBit<Object?> bit) {
+          bit.child.wrapWith(
+            (_, child) => EpubLeafProbe(
+              nodeIndex: nodeIndex,
+              element: node,
+              child: child,
+            ),
+          );
+        }
+        return tree;
+      },
+    );
+  }
+
+  BuildOp _inlineOp(BuildTree meta) {
+    final node = meta.element;
+    return .v2(
+      priority: _afterLateBuildOpPriority,
+      onParsed: (tree) {
+        final replaced = !identical(tree, meta);
+        final hidden = meta.isInline != true || (replaced && tree.isEmpty);
+        final solo =
+            !hidden && replaced && tree.children.singleOrNull is WidgetBit;
+        _inlineMeta[node] = (hidden: hidden, solo: solo, pre: 0, post: 0);
+        return tree;
+      },
+      onRenderInline: (tree) {
+        final bits = tree.children.where((b) => b.isInline != false).toList();
+        final pre = bits.takeWhile(_isWidgetBit).length;
+        final post = bits.sublist(pre).reversed.takeWhile(_isWidgetBit).length;
+        _inlineMeta[node] = (hidden: false, solo: false, pre: pre, post: post);
+      },
+    );
   }
 
   @override
@@ -85,6 +149,8 @@ class MeasuringPaginatedEpubWidgetFactory({
     InlineSpan text,
   ) {
     final child = super.buildText(tree, resolved, text);
+    if (tree.isInline != false) return child;
+
     final nodeIndex = _nodeIndex(tree.element);
 
     if (child == null || nodeIndex == null) return child;
@@ -93,6 +159,7 @@ class MeasuringPaginatedEpubWidgetFactory({
       nodeIndex: nodeIndex,
       element: tree.element,
       whitespace: resolved.get<CssWhitespace>() ?? CssWhitespace.normal,
+      inlineMeta: _inlineMeta,
       child: child,
     );
   }
@@ -123,6 +190,8 @@ class MeasuringPaginatedEpubWidgetFactory({
       child: tracked,
     );
   }
+
+  static bool _isWidgetBit(BuildBit bit) => bit is WidgetBit;
 
   static int? _nodeIndex(dom.Element element) {
     final indexAttr =

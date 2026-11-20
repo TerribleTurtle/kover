@@ -8,6 +8,7 @@ sealed class HtmlConstants {
   static const String startsMidBlockAttribute = 'kover-starts-mid-block';
   static const String trimStartAttribute = 'kover-trim-start';
   static const String trimEndAttribute = 'kover-trim-end';
+  static const String epubTypeAttribute = 'epub:type';
 
   // Kavita-specific constants
   static const String kavitaWrapperClass = 'book-content';

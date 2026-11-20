@@ -2,6 +2,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 import 'package:html/dom.dart' as dom;
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/measure/epub_text_index.dart';
 
 /// Renders an element and lets the harvest pass read its rect.
 sealed class RenderEpubProbe extends RenderProxyBox {
@@ -73,6 +74,7 @@ class const EpubTextProbe({
   required final int nodeIndex,
   required final dom.Element element,
   required final CssWhitespace whitespace,
+  final Map<dom.Element, EpubInlineMeta> inlineMeta = const {},
   super.child,
 }) extends SingleChildRenderObjectWidget {
   @override
@@ -81,6 +83,7 @@ class const EpubTextProbe({
       nodeIndex: nodeIndex,
       element: element,
       whitespace: whitespace,
+      inlineMeta: inlineMeta,
     );
   }
 
@@ -92,7 +95,8 @@ class const EpubTextProbe({
     renderObject
       ..nodeIndex = nodeIndex
       ..element = element
-      ..whitespace = whitespace;
+      ..whitespace = whitespace
+      ..inlineMeta = inlineMeta;
   }
 }
 
@@ -100,6 +104,7 @@ final class RenderEpubTextProbe({
   required super.nodeIndex,
   required super.element,
   required var CssWhitespace whitespace,
+  var Map<dom.Element, EpubInlineMeta> inlineMeta = const {},
 }) extends RenderEpubProbe;
 
 /// Measures spacing retained when a split block is rendered on a subpage.

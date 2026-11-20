@@ -2,11 +2,14 @@ import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:kover/utils/constants/html_constants.dart';
 
+/// Resolved inline widget metadata recorded for an element during layout.
+typedef EpubInlineMeta = ({bool hidden, bool solo, int pre, int post});
+
 /// A position inside the DOM that corresponds to a character of the flattened
 /// inline text.
 class const EpubTextPosition({
   required final dom.Node node,
-  required final int offset,
+  final int offset = 0,
   final bool afterNode = false,
 });
 
@@ -40,7 +43,7 @@ class const EpubTextIndex._(final List<EpubTextPosition> _positions) {
   /// throws [EpubTextIndexMismatch].
   factory build({
     required dom.Element block,
-    required Set<dom.Element> blockElements,
+    Map<dom.Element, EpubInlineMeta> inlineMeta = const {},
     required CssWhitespace whitespace,
     required String plainText,
   }) {
@@ -49,7 +52,7 @@ class const EpubTextIndex._(final List<EpubTextPosition> _positions) {
     _collect(
       block: block,
       node: block,
-      blockElements: blockElements,
+      inlineMeta: inlineMeta,
       whitespace: whitespace,
       tokens: tokens,
     );
@@ -84,7 +87,7 @@ class const EpubTextIndex._(final List<EpubTextPosition> _positions) {
         if (token is! _InlineToken) {
           throw EpubTextIndexMismatch('expected inline widget at $i');
         }
-        positions.add(EpubTextPosition(node: token.element, offset: 0));
+        positions.add(token.position);
         index++;
         continue;
       }
@@ -171,7 +174,7 @@ _Token? _peek(List<_Token> tokens, int index) => tokens.elementAtOrNull(index);
 void _collect({
   required dom.Element block,
   required dom.Node node,
-  required Set<dom.Element> blockElements,
+  required Map<dom.Element, EpubInlineMeta> inlineMeta,
   required CssWhitespace whitespace,
   required List<_Token> tokens,
 }) {
@@ -206,104 +209,71 @@ void _collect({
   if (node is! dom.Element) return;
 
   final localName = node.localName;
-  if (localName == 'br') {
+  final isChild = !identical(node, block);
+  final meta = isChild ? inlineMeta[node] : null;
+  if (meta?.hidden == true) return;
+  final before = _InlineToken(EpubTextPosition(node: node));
+  if (meta?.solo == true) {
+    tokens.add(before);
+    return;
+  }
+  if (isChild && localName == 'ruby') {
+    tokens.addAll(_rubyTokens(node, inlineMeta, whitespace));
+    return;
+  }
+  tokens.addAll(List.filled(meta?.pre ?? 0, before));
+  if (isChild && localName == 'br') {
     tokens.add(_BreakToken(node));
-    return;
   }
-
-  if (localName == 'sup' || _hasInlineBlockDisplay(node)) {
-    if (node.attributes.containsKey('id')) tokens.add(_InlineToken(node));
-    tokens.add(_InlineToken(node));
-    return;
-  }
-
-  if (localName != null && _inlineWidgetTags.contains(localName)) {
-    tokens.add(_InlineToken(node));
-    if (node.attributes.containsKey('id')) tokens.add(_InlineToken(node));
-    return;
-  }
-
-  // Inline elements with an id get an extra anchor placeholder from fwfh.
-  if (node.attributes.containsKey('id') && !blockElements.contains(node)) {
-    tokens.add(_InlineToken(node));
-  }
-
-  final isInline = !blockElements.contains(node);
-  if (isInline) {
-    if (_hasInlineHorizontalSpace(node, 'margin', 'left')) {
-      tokens.add(_InlineToken(node));
-    }
-    if (_hasInlineHorizontalSpace(node, 'padding', 'left')) {
-      tokens.add(_InlineToken(node));
-    }
-  }
-
   for (final child in node.nodes) {
-    final isNestedBlock =
-        child is dom.Element &&
-        !identical(child, block) &&
-        blockElements.contains(child) &&
-        !_isInlineWidgetElement(child);
-    if (isNestedBlock) continue;
     _collect(
       block: block,
       node: child,
-      blockElements: blockElements,
+      inlineMeta: inlineMeta,
       whitespace: whitespace,
       tokens: tokens,
     );
   }
-
-  if (isInline) {
-    if (_hasInlineHorizontalSpace(node, 'padding', 'right')) {
-      tokens.add(_InlineToken(node));
-    }
-    if (_hasInlineHorizontalSpace(node, 'margin', 'right')) {
-      tokens.add(_InlineToken(node));
-    }
-  }
+  final after = _InlineToken(EpubTextPosition(node: node, afterNode: true));
+  tokens.addAll(List.filled(meta?.post ?? 0, after));
 }
 
-bool _hasInlineHorizontalSpace(
-  dom.Element element,
-  String property,
-  String side,
+List<_Token> _rubyTokens(
+  dom.Element ruby,
+  Map<dom.Element, EpubInlineMeta> inlineMeta,
+  CssWhitespace space,
 ) {
-  for (final style in element.styles) {
-    if (style.property == '$property-$side' || style.property == property) {
-      return true;
+  final out = <_Token>[];
+  final base = <_Token>[];
+  _InlineToken? pairStart = _InlineToken(EpubTextPosition(node: ruby));
+  for (final child in ruby.nodes) {
+    final part = <_Token>[];
+    _collect(
+      block: ruby,
+      node: child,
+      inlineMeta: inlineMeta,
+      whitespace: space,
+      tokens: part,
+    );
+    final isRt = child is dom.Element && child.localName == 'rt';
+    if (base.isNotEmpty && isRt && part.isNotEmpty) {
+      out.add(pairStart!);
+      base.clear();
+      pairStart = null;
+      continue;
+    }
+    for (final token in part) {
+      if (base.isEmpty && token is _WhitespaceToken) {
+        out.add(token);
+        continue;
+      }
+      final pos = child is dom.Text && token is _CharToken ? token.offset : 0;
+      pairStart ??= _InlineToken(EpubTextPosition(node: child, offset: pos));
+      base.add(token);
     }
   }
-  return false;
+  return out..addAll(base);
 }
-
-bool _hasInlineBlockDisplay(dom.Element element) {
-  final style = element.attributes['style'];
-  if (style == null) return false;
-  return RegExp(
-    r'display\s*:\s*inline-block',
-    caseSensitive: false,
-  ).hasMatch(style);
-}
-
-bool _isInlineWidgetElement(dom.Element element) {
-  final localName = element.localName;
-  return localName == 'sup' ||
-      localName == 'sub' ||
-      (localName != null && _inlineWidgetTags.contains(localName)) ||
-      _hasInlineBlockDisplay(element);
-}
-
-const _inlineWidgetTags = {
-  'img',
-  'svg',
-  'video',
-  'audio',
-  'canvas',
-  'iframe',
-  'object',
-  'embed',
-};
 
 bool _isWhitespace(String char) =>
     char == ' ' || char == '\t' || char == '\n' || char == '\r' || char == '\f';
@@ -337,8 +307,4 @@ final class _BreakToken extends _Token {
   final dom.Element element;
 }
 
-final class _InlineToken extends _Token {
-  const _InlineToken(this.element);
-
-  final dom.Element element;
-}
+final class const _InlineToken(final EpubTextPosition position) extends _Token;

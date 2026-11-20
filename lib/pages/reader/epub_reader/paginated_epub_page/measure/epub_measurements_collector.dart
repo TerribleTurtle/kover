@@ -182,18 +182,6 @@ class _EpubMeasureContentState extends State<_EpubMeasureContent> {
 /// turns it into measurement units, ordered by the render tree.
 EpubMeasurements _collectMeasurements(RenderEpubMeasureAnchor anchor) {
   final units = <EpubMeasureUnit>[];
-  final blockElements = <dom.Element>{};
-
-  // Text probes are grouped by their nearest block, so nested block elements
-  // must be known before line boxes are mapped back to DOM positions.
-  void collectBlocks(RenderObject node) {
-    if (node is RenderEpubBlockProbe) {
-      blockElements.add(node.element);
-    }
-    node.visitChildren(collectBlocks);
-  }
-
-  collectBlocks(anchor);
 
   void walk(RenderObject node) {
     // Text probes are emitted by their owning block below.
@@ -217,12 +205,11 @@ EpubMeasurements _collectMeasurements(RenderEpubMeasureAnchor anchor) {
           _collectTextUnits(
             probes: textProbes,
             origin: anchor,
-            blockElements: blockElements,
           ),
         );
-      } else if (!_hasProbeDescendant(node)) {
-        // A block without any probe below it cannot be split (image, rule,
-        // empty block...).
+      } else if (!_hasSplittableProbeDescendant(node)) {
+        // A block without nested blocks, text, or multiple leaves cannot be
+        // split internally (image, rule, empty block, sole inline widget...).
         final unit = _leafUnit(
           nodeIndex: node.nodeIndex,
           box: node,
@@ -263,26 +250,30 @@ List<RenderEpubTextProbe> _collectOwnTextProbes(RenderObject block) {
   return probes;
 }
 
-bool _hasProbeDescendant(RenderObject node) {
-  var found = false;
+bool _hasSplittableProbeDescendant(RenderObject node) {
+  var leafCount = 0;
+  var splittable = false;
 
   void walk(RenderObject current) {
-    if (found) return;
-    if (current is RenderEpubProbe) {
-      found = true;
+    if (splittable) return;
+    if (current is RenderEpubBlockProbe || current is RenderEpubTextProbe) {
+      splittable = true;
+      return;
+    }
+    if (current is RenderEpubLeafProbe) {
+      if (++leafCount > 1) splittable = true;
       return;
     }
     current.visitChildren(walk);
   }
 
   node.visitChildren(walk);
-  return found;
+  return splittable;
 }
 
 List<EpubMeasureUnit> _collectTextUnits({
   required List<RenderEpubTextProbe> probes,
   required RenderBox origin,
-  required Set<dom.Element> blockElements,
 }) {
   final units = <EpubMeasureUnit>[];
 
@@ -310,7 +301,7 @@ List<EpubMeasureUnit> _collectTextUnits({
       try {
         index = EpubTextIndex.build(
           block: probe.element,
-          blockElements: blockElements,
+          inlineMeta: probe.inlineMeta,
           whitespace: probe.whitespace,
           plainText: plainText,
         );

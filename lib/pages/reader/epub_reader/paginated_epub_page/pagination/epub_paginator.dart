@@ -84,20 +84,14 @@ class EpubPaginator({required final dom.DocumentFragment root}) {
       scrollId,
     );
 
-    if (element == null) return null;
-
-    final nodeIndex = _nodeIndex(element);
-    return _nodeIndexSubpage[nodeIndex];
+    return element == null ? null : _subpageForElement(element);
   }
 
   /// Returns the first subpage whose markup contains an element with [id].
   int? subpageForElementId(String id) {
     final element = root.findByAttribute('id', id);
 
-    if (element == null) return null;
-
-    final nodeIndex = _nodeIndex(element);
-    return _nodeIndexSubpage[nodeIndex];
+    return element == null ? null : _subpageForElement(element);
   }
 
   /// Returns the scroll id of the first paragraph on [index], if any.
@@ -138,6 +132,26 @@ class EpubPaginator({required final dom.DocumentFragment root}) {
     _subpageHtml[index] = subpage;
 
     return subpage;
+  }
+
+  int? _subpageForElement(dom.Element element) {
+    final nodeIndex = _nodeIndex(element);
+    final direct = _nodeIndexSubpage[nodeIndex];
+    if (direct != null) return direct;
+
+    for (final child in element.querySelectorAll(
+      '[${HtmlConstants.nodeIndexAttribute}]',
+    )) {
+      final subpage = _nodeIndexSubpage[_nodeIndex(child)];
+      if (subpage != null) return subpage;
+    }
+
+    final marker = '${HtmlConstants.nodeIndexAttribute}="$nodeIndex"';
+    for (var i = 0; i < subpageCount; i++) {
+      if (getSubpage(i).contains(marker)) return i;
+    }
+
+    return null;
   }
 
   int _nodeIndex(dom.Element element) {

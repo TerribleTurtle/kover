@@ -6,11 +6,16 @@ import 'package:kover/mapping/enums/read_direction.dart';
 import 'package:kover/pages/reader/epub_reader/epub_reader_provider.dart';
 import 'package:kover/pages/reader/epub_reader/epub_theme_override.dart';
 import 'package:kover/pages/reader/epub_reader/epub_toc_drawer.dart';
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/css_engine.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/epub_anchor_target.dart';
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/epub_footnote_bottom_sheet.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/paginated_epub_page.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/paginated_epub_page_controller.dart';
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/paginated_epub_page_settings.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page_provider.dart';
 import 'package:kover/pages/reader/overlay/reader_overlay.dart';
+import 'package:kover/riverpod/managers/font_manager.dart';
+import 'package:kover/riverpod/providers/book.dart';
 import 'package:kover/riverpod/providers/reader/epub_reader.dart';
 import 'package:kover/riverpod/providers/settings/epub_reader_settings.dart';
 import 'package:kover/utils/constants/layout_constants.dart';
@@ -308,7 +313,9 @@ class _Page extends HookConsumerWidget {
       },
     );
 
-    void handleAnchor(EpubAnchorTarget target) {
+    final footnoteToken = useRef(0);
+
+    void navigateToAnchor(EpubAnchorTarget target) {
       if (target.externalUri case final uri?) {
         _openExternal(uri);
         return;
@@ -331,6 +338,47 @@ class _Page extends HookConsumerWidget {
       }
     }
 
+    Future<void> handleAnchor(
+      EpubAnchorTarget target,
+      PaginatedEpubPageSettings settings,
+    ) async {
+      final token = ++footnoteToken.value;
+      final part = target.part;
+      if (!target.isFootnote || part == null) {
+        navigateToAnchor(target);
+        return;
+      }
+
+      final originSubpage = controller.currentSubpage;
+      final preview = await _resolveFootnotePreview(
+        ref: ref,
+        controller: controller,
+        chapterId: chapterId,
+        currentPage: page,
+        targetPage: target.page,
+        part: part,
+      );
+
+      if (!context.mounted || footnoteToken.value != token) return;
+      if (ref.read(nav).value?.page != page ||
+          controller.currentSubpage != originSubpage) {
+        return;
+      }
+
+      if (preview == null) {
+        navigateToAnchor(target);
+        return;
+      }
+
+      await showEpubFootnoteBottomSheet(
+        context: context,
+        html: preview.html,
+        settings: settings,
+        cssEngine: preview.cssEngine,
+        onAnchorTap: navigateToAnchor,
+      );
+    }
+
     return Async(
       asyncValue: model,
       data: (data) => NotificationListener<ScrollNotification>(
@@ -343,10 +391,44 @@ class _Page extends HookConsumerWidget {
           settings: data.settings,
           resumeScrollId: data.resumeScrollId,
           onSelectionChanged: onSelectionChanged,
-          onAnchorTap: handleAnchor,
+          onAnchorTap: (target) => handleAnchor(target, data.settings),
         ),
       ),
     );
+  }
+}
+
+Future<({String html, CssEngine cssEngine})?> _resolveFootnotePreview({
+  required WidgetRef ref,
+  required PaginatedEpubPageController controller,
+  required int chapterId,
+  required int currentPage,
+  required int? targetPage,
+  required String part,
+}) async {
+  if (targetPage == null || targetPage == currentPage || targetPage == 0) {
+    final localHtml = controller.extractFootnoteHtml(part);
+    if (localHtml != null) {
+      return (html: localHtml, cssEngine: controller.cssEngine);
+    }
+  }
+
+  if (targetPage == null || targetPage == currentPage) {
+    return null;
+  }
+
+  try {
+    final content = await ref.read(
+      epubPageProvider(chapterId: chapterId, page: targetPage).future,
+    );
+    await ref.read(fontManagerProvider.notifier).ensureLoaded(content.fonts);
+    return controller.extractRemoteFootnote(content.root, part);
+  } catch (e) {
+    log.warning(
+      'failed to load remote footnote page',
+      attributes: {'page': targetPage, 'part': part, 'error': e},
+    );
+    return null;
   }
 }
 

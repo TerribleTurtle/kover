@@ -539,6 +539,51 @@ void main() {
         expect(notifications, 1);
       });
     });
+
+    group('footnotes', () {
+      test(
+        'extractFootnoteHtml returns null before attachRoot and extracts after',
+        () {
+          final controller = PaginatedEpubPageController();
+          expect(controller.extractFootnoteHtml('#fn1'), isNull);
+
+          controller.attachRoot(
+            dom.DocumentFragment.html(
+              '<div><p>Body</p><aside id="fn1"><p>Attached note.</p></aside></div>',
+            ),
+            settings: _pageSettings(),
+          );
+
+          final html = controller.extractFootnoteHtml('#fn1');
+          expect(
+            dom.DocumentFragment.html(html!).text,
+            contains('Attached note.'),
+          );
+        },
+      );
+
+      test('extractRemoteFootnote forwards updated additional styles', () {
+        final controller = _ready(_controller(_singlePage))
+          ..updateStyles({
+            '.note': {'color': 'red'},
+          });
+
+        final remote = controller.extractRemoteFootnote(
+          dom.DocumentFragment.html(
+            '<aside id="fn2" class="note"><p>Remote body.</p></aside>',
+          ),
+          'fn2',
+        );
+
+        final parsed = dom.DocumentFragment.html(remote!.html);
+        expect(
+          remote.cssEngine.stylesFor(
+            element: parsed.querySelector('aside')!,
+          )?['color'],
+          'red',
+        );
+      });
+    });
   });
 }
 

@@ -1,6 +1,7 @@
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/css_engine.dart';
+import 'package:kover/pages/reader/epub_reader/paginated_epub_page/epub_footnote_extractor.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/measure/epub_measurements_collector.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/paginated_epub_page_settings.dart';
 import 'package:kover/pages/reader/epub_reader/paginated_epub_page/pagination/epub_paginator.dart';
@@ -37,6 +38,7 @@ class PaginatedEpubPageController({
   String? _pendingAnchor;
   PaginatedEpubPageSettings? _settings;
   Object? _measuredLayoutKey;
+  Map<String, Map<String, String>> _additionalStyles = const {};
 
   PaginatedEpubPageControllerStatus get status => _status;
   dom.DocumentFragment? get root => _paginator?.root;
@@ -129,6 +131,7 @@ class PaginatedEpubPageController({
       root: root,
       additionalStyles: additionalStyles,
     );
+    _additionalStyles = additionalStyles;
     _settings = settings;
     _initialXpath = initialXpath;
     _highlightedElement = settings.highlightResumePoint
@@ -144,6 +147,7 @@ class PaginatedEpubPageController({
 
   /// Updates the additional CSS styles.
   void updateStyles(Map<String, Map<String, String>> additionalStyles) {
+    _additionalStyles = additionalStyles;
     _cssEngine?.updateAdditionalStyles(additionalStyles);
     notifyListeners();
   }
@@ -238,6 +242,30 @@ class PaginatedEpubPageController({
   String? scrollIdForSubpage(int index) {
     return _paginator?.scrollIdForSubpage(index);
   }
+
+  /// Extracts sanitized HTML for the footnote referenced by [rawRef] from
+  /// the current chapter page, or null if not found.
+  String? extractFootnoteHtml(String rawRef) {
+    final paginator = _paginator;
+    if (paginator == null) return null;
+
+    return EpubFootnoteExtractor.extractFromRoot(
+      paginator.root,
+      rawRef,
+      cssEngine: _cssEngine,
+    );
+  }
+
+  /// Preprocesses [remoteHtml] and extracts the footnote referenced by [rawRef]
+  /// along with a [CssEngine] built against [remoteHtml]'s stylesheets.
+  ({String html, CssEngine cssEngine})? extractRemoteFootnote(
+    dom.DocumentFragment remoteHtml,
+    String rawRef,
+  ) => EpubFootnoteExtractor.extractRemote(
+    remoteHtml,
+    rawRef,
+    additionalStyles: _additionalStyles,
+  );
 
   /// Returns the subpage that contains the element with [anchor].
   ///

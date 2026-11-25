@@ -212,6 +212,24 @@ void main() {
       expect(last, contains('<img'));
       expect(last, isNot(contains('Before')));
     });
+
+    test('resolves element ids on wrappers and inline children', () {
+      final paginator = _paginator(
+        '<div id="sec1"><p>First</p></div>'
+        '<div id="sec2"><h2><span id="part1">Part I</span></h2></div>',
+      );
+      final p = _nodeIndexOf(paginator.root, 'p');
+      final h2 = _nodeIndexOf(paginator.root, 'h2');
+
+      paginator.paginate([
+        _line(nodeIndex: p, top: 0, bottom: 10),
+        _line(nodeIndex: h2, top: 20, bottom: 30, isLeaf: true),
+      ], 15);
+
+      expect(paginator.subpageForElementId('sec1'), 0);
+      expect(paginator.subpageForElementId('sec2'), 1);
+      expect(paginator.subpageForElementId('part1'), 1);
+    });
   });
 }
 
